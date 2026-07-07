@@ -1,0 +1,36 @@
+{
+  "name": "lms-ai-tutor-server",
+  "version": "1.0.0",
+  "description": "Backend API for LMS with RAG-based AI Tutor",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "@google/generative-ai": "^0.24.1",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.10.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^8.5.2",
+    "express-validator": "^7.2.0",
+    "helmet": "^8.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.8.3",
+    "morgan": "^1.10.0",
+    "multer": "^2.2.0",
+    "openai": "^4.73.1",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.19.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
