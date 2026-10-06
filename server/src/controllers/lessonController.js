@@ -1,9 +1,10 @@
 const Lesson = require('../models/Lesson');
+const Course = require('../models/Course');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
-const { assertCanManageCourse } = require('../utils/permissions');
+const { assertCanManageCourse, canManageCourse, canAccessCourseContent } = require('../utils/permissions');
 const { uploadBufferToCloudinary, deleteFromCloudinary } = require('../config/upload');
-const { extractText, isExtractable } = require('../services/textExtractionService');
+const { extractPages, isExtractable } = require('../services/textExtractionService');
 const {
   indexLesson,
   removeLessonIndex,
@@ -11,14 +12,48 @@ const {
   removeAttachmentIndex,
 } = require('../services/lessonIndexingService');
 
+// Same nested shape as getCourseById's `lessons` array: full content only for
+// an enrolled student, the owning tutor, or an admin — everyone else (this
+// route has no auth middleware, so that includes anonymous requests) only
+// gets preview-safe metadata. Not currently called by the frontend (course
+// detail gets its lesson list from getCourseById instead), but it's still a
+// reachable API endpoint returning the same paywalled data, so it needs the
+// same guard.
 const listLessonsForCourse = asyncHandler(async (req, res) => {
+  const course = await Course.findById(req.params.courseId).lean();
+  if (!course) throw new ApiError(404, 'Course not found');
+
+  const isManager = Boolean(req.user) && canManageCourse(course, req.user);
+  if (!course.published && !isManager) {
+    throw new ApiError(404, 'Course not found');
+  }
+
+  const hasFullAccess = isManager || (await canAccessCourseContent(course, req.user));
   const lessons = await Lesson.find({ course: req.params.courseId }).sort({ order: 1 }).lean();
-  res.json({ lessons });
+
+  const responseLessons = hasFullAccess
+    ? lessons
+    : lessons.map(({ _id, course: courseId, title, order }) => ({ _id, course: courseId, title, order }));
+
+  res.json({ lessons: responseLessons });
 });
 
+// Full lesson content (text, video, attachments) — gated the same way
+// askQuestion/attemptQuiz gate the AI tutor and quiz attempts: enrolled
+// student, owning tutor, or admin only. Route requires `protect` so req.user
+// is always populated here.
 const getLesson = asyncHandler(async (req, res) => {
   const lesson = await Lesson.findById(req.params.id).lean();
   if (!lesson) throw new ApiError(404, 'Lesson not found');
+
+  const course = await Course.findById(lesson.course).lean();
+  if (!course) throw new ApiError(404, 'Lesson not found');
+
+  const hasAccess = await canAccessCourseContent(course, req.user);
+  if (!hasAccess) {
+    throw new ApiError(403, 'You must be enrolled in this course to view this lesson');
+  }
+
   res.json({ lesson });
 });
 
@@ -50,7 +85,11 @@ const updateLesson = asyncHandler(async (req, res) => {
   await assertCanManageCourse(lesson.course, req.user);
 
   const { title, content, order, videoUrl } = req.body;
-  const contentChanged = content !== undefined && content !== lesson.content;
+  // The lesson title is part of each chunk's embedded context header, so a
+  // rename needs a re-index just like a content edit does.
+  const contentChanged =
+    (content !== undefined && content !== lesson.content) ||
+    (title !== undefined && title !== lesson.title);
 
   if (title !== undefined) lesson.title = title;
   if (content !== undefined) lesson.content = content;
@@ -115,9 +154,9 @@ const uploadAttachment = asyncHandler(async (req, res) => {
 
   if (isExtractable(attachment.mimetype)) {
     try {
-      const text = await extractText(req.file.buffer, attachment.mimetype);
-      if (text.trim()) {
-        indexedChunks = await indexAttachmentText(lesson, attachment, text);
+      const pages = await extractPages(req.file.buffer, attachment.mimetype);
+      if (pages.some((page) => page.trim())) {
+        indexedChunks = await indexAttachmentText(lesson, attachment, pages);
         attachment.indexedForRag = indexedChunks > 0;
         await lesson.save();
       }

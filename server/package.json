@@ -7,7 +7,15 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "seed": "node src/seed.js"
+    "seed": "node src/seed.js",
+    "test": "node --test \"tests/*.test.js\"",
+    "reindex": "node src/scripts/reindex.js",
+    "eval:validate": "node eval/validate.js",
+    "eval": "node eval/run.js",
+    "eval:tune": "node eval/tune.js",
+    "eval:report": "node eval/report.js",
+    "eval:e2e": "node eval/e2e.js",
+    "eval:latency": "node eval/latency.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
@@ -28,7 +36,8 @@
     "multer": "^2.2.0",
     "openai": "^4.73.1",
     "pdf-parse": "^2.4.5",
-    "pdfkit": "^0.19.1"
+    "pdfkit": "^0.19.1",
+    "wink-porter2-stemmer": "^2.0.1"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"

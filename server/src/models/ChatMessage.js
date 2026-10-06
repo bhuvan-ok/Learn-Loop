@@ -1,8 +1,8 @@
 const mongoose = require('mongoose');
 
 // Persists AI Tutor Q&A history per student/course, including which lesson
-// chunks were retrieved and cited to ground each answer (for transparency
-// and for measuring retrieval quality later).
+// passages grounded each answer (for transparency and for measuring retrieval
+// quality later).
 const citedChunkSchema = new mongoose.Schema(
   {
     lesson: { type: mongoose.Schema.Types.ObjectId, ref: 'Lesson' },
@@ -12,6 +12,25 @@ const citedChunkSchema = new mongoose.Schema(
     score: Number,
     source: { type: String, enum: ['content', 'attachment'], default: 'content' },
     sourceLabel: { type: String, default: '' },
+    // Excerpt number the model saw ("E1") — matches the [E1] tags in the answer.
+    excerpt: Number,
+    contextHeader: { type: String, default: '' },
+    page: { type: Number, default: null },
+    // True when the model emitted no citation tag and this passage was
+    // attached as the closest related source instead.
+    inferred: { type: Boolean, default: false },
+  },
+  { _id: false }
+);
+
+const retrievalMetaSchema = new mongoose.Schema(
+  {
+    pipeline: String,
+    standaloneQuestion: String,
+    retrievedCount: Number,
+    abstained: Boolean,
+    llmCalls: Number,
+    latencyMs: Number,
   },
   { _id: false }
 );
@@ -23,6 +42,7 @@ const chatMessageSchema = new mongoose.Schema(
     question: { type: String, required: true },
     answer: { type: String, required: true },
     citedChunks: { type: [citedChunkSchema], default: [] },
+    retrieval: { type: retrievalMetaSchema, default: undefined },
   },
   { timestamps: true }
 );

@@ -25,17 +25,54 @@ Admin accounts cannot be created through public registration (`POST /api/auth/re
 | Database | MongoDB (Mongoose) |
 | File uploads | Multer (in-memory) → Cloudinary, `pdf-parse` for PDF text extraction |
 | Auth | JWT + bcrypt, role-based access control (admin / tutor / student) |
-| Embeddings | OpenAI `text-embedding-3-small`, or Google Gemini `text-embedding-004` |
+| Embeddings | Google Gemini `gemini-embedding-001` (default), or OpenAI `text-embedding-3-small` |
 | Chat generation | Anthropic Claude (default), OpenAI, or Google Gemini — switchable via env var |
-| Vector retrieval | MongoDB Atlas Vector Search, with an in-memory cosine-similarity fallback that works on any MongoDB instance |
+| Retrieval | Hybrid dense + BM25 candidate generation fused with Reciprocal Rank Fusion, LLM reranking, MMR; dense search runs on MongoDB Atlas Vector Search or exact in-process cosine (works on any MongoDB) |
 
 ## How the RAG pipeline works
 
-1. **Indexing lesson content** — When a tutor creates or edits a lesson, its text is split into ~800-character overlapping chunks (`server/src/utils/chunkText.js`), each embedded via the OpenAI embeddings API, and stored in the `LessonChunk` collection (`server/src/services/lessonIndexingService.js`).
-2. **Indexing uploaded files** — When a tutor uploads a PDF or text/markdown file to a lesson, the text is extracted (`server/src/services/textExtractionService.js`), chunked, and embedded the same way — tagged with `source: 'attachment'` and the original filename, so the tutor can add reference material beyond hand-typed lesson text. Other file types (images, slides) are stored and downloadable but not indexed.
-3. **Retrieval** — When a student asks the AI tutor a question, the question is embedded the same way, then the top-k most similar chunks *within that course* are retrieved (`server/src/services/retrievalService.js`) — across both lesson content and attachments. This runs against MongoDB Atlas Vector Search in production, or a brute-force cosine-similarity scan in local/dev environments — controlled by `VECTOR_SEARCH_MODE`, with no code changes required to switch.
-4. **Grounded generation** — The retrieved chunks are passed to the LLM with an explicit instruction to answer only from the provided excerpts and to cite which excerpt(s) support the answer (`server/src/services/ragService.js`). If nothing relevant is found, the tutor says so instead of guessing.
-5. **Transparency** — Every Q&A pair is stored in `ChatMessage` along with exactly which chunks were cited (including whether they came from a lesson or an uploaded file), so answers are auditable and retrieval quality can be evaluated later.
+The pipeline is configured by a named preset (`RAG_PIPELINE`, see `server/src/config/ragConfig.js`). `advanced` is the default; `basic` is the original dense-only pipeline, kept as a kill switch and as the frozen baseline the evaluation compares against.
+
+**Indexing** (when a lesson is saved or a file is uploaded — `lessonIndexingService.js`)
+1. **Structure-aware chunking** (`utils/structuredChunker.js`) — text is split on markdown headings and on sentence boundaries (abbreviation-aware), code blocks stay whole, overlap is whole sentences, and chunks never straddle a section. PDFs are extracted page by page, so chunks carry a page number and plain-text headings (`1. Pagination`) are detected.
+2. **Contextual headers** — the text that is embedded (and BM25-indexed) is prefixed with `Lesson > Section`, so a passage like "This is why `.then()` always runs first" still carries its subject. The stored/cited passage stays clean.
+3. **Asymmetric embeddings** — chunks are embedded as `RETRIEVAL_DOCUMENT` and questions as `RETRIEVAL_QUERY` (Gemini task types).
+4. **Safe re-indexing** — new chunks are embedded first and inserted before the old ones are deleted, so a failed embedding never leaves a lesson with no index. Chunks are tagged with an `indexVersion`; retrieval warns when a course mixes versions, and `npm run reindex` rebuilds them.
+
+**Answering a question** (`services/rag/pipeline.js`, `ragService.js`)
+1. **Query rewrite** — a follow-up like "what about PATCH?" is rewritten into a standalone question using the last three turns (skipped when there is no history).
+2. **Hybrid candidates** — dense similarity (Atlas `$vectorSearch` or exact local cosine) and an in-process BM25 index (Porter-stemmed, cached per course) each return 20 candidates, merged with Reciprocal Rank Fusion.
+3. **LLM rerank + MMR** — one listwise LLM call scores every candidate 0–10 for the question; near-duplicates are removed with Maximal Marginal Relevance.
+4. **Calibrated abstention** — the reranker's score decides whether the course covers the question at all (and drops weak chunks), replacing the original fixed cosine cut-off of 0.15, which never refused anything. Thresholds are tuned on a held-out dev split.
+5. **Small-to-big context** — each hit is expanded with its neighbouring chunks (overlap removed) before generation.
+6. **Grounded generation with real citations** — excerpts are labelled `[E1]…`; the model tags the claims they support and the server saves only the excerpts the answer actually cited (with page and snippet) instead of recording every retrieved chunk. If the client disconnects, generation is cancelled upstream.
+7. **Transparency** — each `ChatMessage` stores the cited passages plus retrieval metadata (standalone question, number of LLM calls, latency, whether it abstained).
+
+Optional stages that are implemented and unit-tested but **not enabled by default** because they have not been measured yet: multi-query expansion, HyDE (gated on a weak first pass), and LLM-written context notes per chunk ("contextual retrieval"). See the evaluation notes below.
+
+## Evaluating retrieval quality
+
+`server/eval/` measures the pipeline against a **frozen copy of the original RAG** on a hand-labelled set of 90 questions over a 39-lesson corpus (plus a PDF), with a held-out test split, paired-bootstrap confidence intervals and a cumulative ablation. Run `npm run eval:validate`, `npm run eval`, `npm run eval:report` in `server/`; methodology and caveats are in [`server/eval/README.md`](server/eval/README.md), full tables in [`server/eval/results/RESULTS.md`](server/eval/results/RESULTS.md).
+
+Held-out test split (51 questions: 42 answerable, 9 not covered by the course), original RAG → current default:
+
+| Metric | Original | Current | Change (95% CI) |
+|---|---|---|---|
+| MRR | 88.3 | 96.0 | +8.8% (−0.4% to +20.3%) |
+| nDCG@5 | 87.9 | 95.4 | +8.5% (+0.7% to +18.6%) |
+| Hit@1 | 81.0 | 92.9 | +14.7% (0.0% to +35.7%) |
+| Recall@5 | 97.6 | 100.0 | +2.4% (0.0% to +7.7%) |
+| Precision of the context given to the LLM | 25.7 | 79.8 | — |
+| Chunks kept as context per question (before neighbour expansion) | 5.0 | 1.7 | — |
+| Out-of-scope questions answered anyway | 100% | 0% | — |
+| In-scope questions wrongly refused | 0% | 0% | — |
+
+Honest reading of these numbers:
+- **Follow-up questions improved most** (MRR 63.9 → 91.7 on the test split) because the original embedded "what about PATCH?" with no context.
+- **The original already scored ~98% Recall@5** on this small corpus, so there is little recall to win; gains are in *ranking*, in sending the model less noise, and in refusing questions the course doesn't cover. A baseline that merely tuned its cut-off to refuse unanswerable questions would have wrongly refused 31% of answerable ones.
+- **Hybrid (BM25) retrieval did not help here.** Dense embeddings already solve the keyword-style queries in this corpus, and BM25 alone is much weaker (MRR 76.8); with equal-weight fusion it *lowered* MRR (94.0 → 88.2). It is kept only in combination with the reranker, where it is neutral on this data, and as a lexical safety net for identifier-heavy real content. This is a property of this corpus and embedding model, not a general claim about hybrid search.
+- **Confidence intervals are wide** (42 answerable test questions); several individual stage gains include zero. One `multi`-passage question and one caching paraphrase got worse.
+- The corpus is synthetic and the LLM-driven stages were evaluated with `gemini-3.1-flash-lite`.
 
 ## Project structure
 
@@ -47,11 +84,18 @@ server/
                    ChatMessage, Certificate, DiscussionPost)
     middleware/     JWT auth, role guard, express-validator error handling, error handling
     validators/     express-validator chains per resource
-    services/       aiService (embeddings/streaming chat), retrievalService, ragService,
-                    lessonIndexingService, textExtractionService, courseService, certificateService
+    services/       aiService (embeddings/streaming chat/utility LLM calls, retries, optional response cache),
+                    ragService (prompting, citations), retrievalService (dense search),
+                    rag/ (pipeline, BM25, rank fusion + MMR, query rewrite, reranker, thresholds, citations,
+                    per-course index cache), lessonIndexingService, textExtractionService, courseService,
+                    certificateService
+    scripts/        reindex.js (rebuild the RAG index under the active pipeline settings)
     controllers/    route handlers per resource (incl. adminController, certificateController, discussionController)
     routes/         Express routers
     seed.js         demo data loader
+  tests/           node:test unit tests (npm test) — chunker, BM25, fusion, citations, pipeline stages, eval metrics
+  eval/            RAG evaluation harness: corpus, labelled dataset, frozen baseline, runner, report
+  atlas/           Atlas Vector Search index definition
 client/
   src/
     context/       AuthContext (JWT session state)
@@ -96,7 +140,9 @@ Visit `http://localhost:5173`.
 
 ### Running without AI keys configured
 
-The app degrades gracefully: courses, lessons, enrollment, progress tracking, quizzes, and file uploads all work with no AI keys set. Only the AI Tutor chat feature requires `GEMINI_API_KEY` — lesson/attachment creation won't fail without it, indexing is just skipped (with a logged warning) until the key is added, and the chat endpoint returns a clean "temporarily unavailable" message rather than leaking provider errors to students.
+The app degrades gracefully: courses, lessons, enrollment, progress tracking, quizzes, and file uploads all work with no AI keys set. Only the AI Tutor feature requires an embeddings key — lesson/attachment creation won't fail without it, indexing is just skipped (loudly logged, since with no chunks indexed the tutor has nothing to answer from) until a key is added, and the chat endpoint returns a clean "temporarily unavailable" message rather than leaking provider errors to students.
+
+**Embeddings specifically require `GEMINI_API_KEY` or `OPENAI_API_KEY`, regardless of `LLM_PROVIDER`.** `LLM_PROVIDER` only selects which model generates the tutor's chat *answers* (Anthropic/OpenAI/Gemini); embeddings (used for indexing lesson/attachment content and for retrieval when a student asks a question) are only available from OpenAI or Google Gemini — **Anthropic has no embeddings API**. So `LLM_PROVIDER=anthropic` (the default when unset) with only `ANTHROPIC_API_KEY` set will index nothing and the AI tutor will never find any content. Set `GEMINI_API_KEY` (free, no billing — https://aistudio.google.com/apikey) or `OPENAI_API_KEY` in addition to whichever key `LLM_PROVIDER` needs for chat. The server logs a warning at startup if neither is set, and `aiService.js` throws a clear error at indexing time explaining the same thing.
 
 ## Notable engineering decisions
 

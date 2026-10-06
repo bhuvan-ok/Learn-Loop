@@ -35,6 +35,18 @@ app.use(
 if (!process.env.CLIENT_ORIGIN && process.env.NODE_ENV === 'production') {
   console.warn('CLIENT_ORIGIN is not set — CORS is falling back to "*" (any origin) in production.');
 }
+// Embeddings (lesson/attachment indexing + AI tutor retrieval) require
+// GEMINI_API_KEY or OPENAI_API_KEY regardless of LLM_PROVIDER — Anthropic has
+// no embeddings API, so ANTHROPIC_API_KEY alone (even with the default
+// LLM_PROVIDER=anthropic) is not enough. Surfacing this at boot means an
+// operator finds out immediately instead of only after a tutor creates a
+// lesson and the AI tutor silently has nothing indexed to answer from.
+if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) {
+  console.warn(
+    'Neither GEMINI_API_KEY nor OPENAI_API_KEY is set — the AI tutor will not work (embeddings for ' +
+      'lesson indexing and question retrieval require one of these regardless of LLM_PROVIDER).'
+  );
+}
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(mongoSanitize());

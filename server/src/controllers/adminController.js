@@ -45,9 +45,6 @@ const listUsers = asyncHandler(async (req, res) => {
 
 const setUserRole = asyncHandler(async (req, res) => {
   const { role } = req.body;
-  if (!['admin', 'student', 'tutor'].includes(role)) {
-    throw new ApiError(400, 'Role must be admin, student, or tutor');
-  }
   if (req.params.id === req.user._id.toString()) {
     throw new ApiError(400, 'You cannot change your own role');
   }

@@ -4,6 +4,8 @@ const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const { askTutor } = require('../services/ragService');
 
+const HISTORY_TURNS = 3;
+
 const askQuestion = asyncHandler(async (req, res) => {
   const { courseId } = req.params;
   const { question } = req.body;
@@ -28,12 +30,18 @@ const askQuestion = asyncHandler(async (req, res) => {
   // res.write() on a dead connection either throws or emits an unhandled
   // 'error' event — either of which would otherwise crash the whole process
   // rather than just failing this one request.
+  //
+  // The abort signal also cancels the upstream LLM request, so tokens aren't
+  // generated (and billed) for a student who has already left.
   let clientGone = false;
+  const abortController = new AbortController();
   res.on('close', () => {
     clientGone = true;
+    if (!res.writableEnded) abortController.abort();
   });
   res.on('error', () => {
     clientGone = true;
+    abortController.abort();
   });
 
   const send = (data) => {
@@ -46,11 +54,21 @@ const askQuestion = asyncHandler(async (req, res) => {
   };
 
   try {
+    // The last few turns let the tutor resolve follow-ups ("what about the
+    // second one?") instead of treating every question as standalone.
+    const recent = await ChatMessage.find({ course: courseId, student: req.user._id })
+      .sort({ createdAt: -1 })
+      .limit(HISTORY_TURNS)
+      .select('question answer')
+      .lean();
+
     const result = await askTutor({
       courseId,
       studentId: req.user._id,
       question: question.trim(),
+      history: recent.reverse(),
       onToken: (token) => send({ token }),
+      signal: abortController.signal,
     });
     send({ done: true, citations: result.citations, chatMessageId: result.chatMessageId });
   } catch (err) {

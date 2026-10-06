@@ -3,7 +3,7 @@ const Lesson = require('../models/Lesson');
 const Quiz = require('../models/Quiz');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
-const { assertCanManageCourse } = require('../utils/permissions');
+const { assertCanManageCourse, canManageCourse, canAccessCourseContent } = require('../utils/permissions');
 const { deleteCourseCascade } = require('../services/courseService');
 
 // Public catalog: only published courses, with optional text search + category filter.
@@ -27,14 +27,43 @@ const listMyCourses = asyncHandler(async (req, res) => {
   res.json({ courses });
 });
 
+// Public-ish course detail: unauthenticated visitors and non-enrolled
+// students only get enough to decide whether to enroll (course info, lesson
+// titles/order, quiz titles) — never lesson content or quiz questions, which
+// is what "Enroll to view"/"Enroll to take" is supposed to gate. Full content
+// is only returned to an enrolled student, the owning tutor, or an admin —
+// mirrors the enrollment check askQuestion/attemptQuiz already enforce.
 const getCourseById = asyncHandler(async (req, res) => {
   const course = await Course.findById(req.params.id).populate('tutor', 'name').lean();
   if (!course) throw new ApiError(404, 'Course not found');
 
+  const isManager = Boolean(req.user) && canManageCourse(course, req.user);
+  // Unpublished/draft courses don't exist as far as the public API is
+  // concerned — only the owning tutor or an admin may preview a draft.
+  if (!course.published && !isManager) {
+    throw new ApiError(404, 'Course not found');
+  }
+
+  const hasFullAccess = isManager || (await canAccessCourseContent(course, req.user));
+
   const lessons = await Lesson.find({ course: course._id }).sort({ order: 1 }).lean();
   const quizzes = await Quiz.find({ course: course._id }).select('-questions.correctOptionIndex').lean();
 
-  res.json({ course, lessons, quizzes });
+  const responseLessons = hasFullAccess
+    ? lessons
+    : lessons.map(({ _id, course: courseId, title, order }) => ({ _id, course: courseId, title, order }));
+
+  const responseQuizzes = hasFullAccess
+    ? quizzes
+    : quizzes.map(({ _id, course: courseId, lesson, title, questions }) => ({
+        _id,
+        course: courseId,
+        lesson,
+        title,
+        questionCount: questions.length,
+      }));
+
+  res.json({ course, lessons: responseLessons, quizzes: responseQuizzes });
 });
 
 const createCourse = asyncHandler(async (req, res) => {

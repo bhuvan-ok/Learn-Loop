@@ -34,4 +34,27 @@ const requireRole = (...roles) => (req, res, next) => {
   next();
 };
 
-module.exports = { protect, requireRole };
+// For routes that must stay publicly browsable (e.g. course detail) but still
+// need to know *who's asking* when a token is present, so the controller can
+// grant enrolled students/owning tutors/admins full content while anonymous
+// visitors get a preview. Unlike `protect`, a missing or invalid token is
+// never fatal here — the request just proceeds unauthenticated.
+const optionalAuth = asyncHandler(async (req, res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.split(' ')[1] : null;
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+      const user = await User.findById(decoded.id).select('-passwordHash');
+      if (user) req.user = user;
+    } catch {
+      // Invalid/expired token on a route that supports anonymous access —
+      // treat as unauthenticated rather than failing the whole request.
+    }
+  }
+
+  next();
+});
+
+module.exports = { protect, requireRole, optionalAuth };

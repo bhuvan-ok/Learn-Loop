@@ -164,12 +164,22 @@ export default function AITutorChat({ courseId }) {
                         <summary className="cursor-pointer">
                           Sources ({m.citedChunks.length})
                         </summary>
-                        <ul className="mt-1 space-y-1 list-disc list-inside">
+                        <ul className="mt-1 space-y-2">
                           {m.citedChunks.map((c, ci) => (
                             <li key={ci}>
-                              {c.source === 'attachment' && c.sourceLabel
-                                ? `${c.sourceLabel} (attached to "${c.lessonTitle}")`
-                                : c.lessonTitle}
+                              <span className="font-medium text-slate-600">
+                                {c.excerpt ? `[E${c.excerpt}] ` : ''}
+                                {c.source === 'attachment' && c.sourceLabel
+                                  ? `${c.sourceLabel} (attached to "${c.lessonTitle}")`
+                                  : c.lessonTitle}
+                                {c.page ? `, page ${c.page}` : ''}
+                                {c.inferred ? ' — closest related source' : ''}
+                              </span>
+                              {c.text && (
+                                <p className="mt-0.5 italic text-slate-400">
+                                  “{c.text.length > 180 ? `${c.text.slice(0, 180)}…` : c.text}”
+                                </p>
+                              )}
                             </li>
                           ))}
                         </ul>
